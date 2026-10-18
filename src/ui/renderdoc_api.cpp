@@ -12,6 +12,10 @@
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
+#if REX_PLATFORM_LINUX
+#include <dlfcn.h>
+#endif
+
 namespace rex {
 namespace ui {
 
@@ -24,6 +28,17 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
   std::unique_ptr<RenderDocAPI> renderdoc_api(new RenderDocAPI());
 
   pRENDERDOC_GetAPI get_api = nullptr;
+
+#if REX_PLATFORM_LINUX
+  // dlopen() of a library that isn't loaded yet loads it, and loading
+  // librenderdoc.so installs RenderDoc's capture hooks into the process
+  // (several ms per frame). Only use it if RenderDoc already injected it.
+  void* already_loaded = dlopen(platform::lib_names::kRenderDoc, RTLD_NOW | RTLD_NOLOAD);
+  if (!already_loaded) {
+    return nullptr;
+  }
+  dlclose(already_loaded);
+#endif
 
   // Try to load the RenderDoc library. If RenderDoc is attached, the library
   // should already be loaded into the process and this will increment the
