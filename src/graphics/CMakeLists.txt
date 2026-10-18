@@ -158,3 +158,74 @@ if(REXGLUE_USE_D3D12)
         dxguid
     )
 endif()
+
+# rexgpu-native: Vulkan renderer rebuilt for speed (librexgpu-native.so,
+# --gpu_plugin=native). Started as a fork of the Xenos Vulkan backend for the
+# Forza Horizon 2 recomp: render targets without full EDRAM emulation,
+# resolves straight into textures, predicated-tiling strips merged into
+# full-frame passes, and a parser / draw / submission thread pipeline. It
+# compiles the generic Xenos layer (PM4 parsing, register file, caches,
+# shader translation) into itself.
+if(REXGLUE_USE_VULKAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    file(GLOB REXGPU_NATIVE_BACKEND_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/native/*.cpp)
+    add_library(rexgpu-native SHARED
+        ${REXGPU_NATIVE_BACKEND_SOURCES}
+        flags.cpp
+        registers.cpp
+        register_file.cpp
+        sampler_info.cpp
+        graphics_system.cpp
+        command_processor.cpp
+        packet_disassembler.cpp
+        primitive_processor.cpp
+        shared_memory.cpp
+        pipeline/render_target/cache.cpp
+        pipeline/texture/cache.cpp
+        pipeline/shader/shader.cpp
+        pipeline/shader/interpreter.cpp
+        pipeline/shader/translator.cpp
+        pipeline/shader/translator_disasm.cpp
+        ${REXGPU_XENOS_SPIRV_SOURCES}
+        format/ucode.cpp
+        util/draw.cpp
+        util/draw_extent_estimator.cpp
+    )
+    add_library(rex::gpu-native ALIAS rexgpu-native)
+    set_target_properties(rexgpu-native PROPERTIES
+        EXPORT_NAME gpu-native
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+    target_include_directories(rexgpu-native PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/native
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${REXGLUE_ROOT}/thirdparty/renderdoc
+        ${REXGLUE_ROOT}
+    )
+    target_compile_options(rexgpu-native PRIVATE -Wno-unused-variable
+        -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g)
+    target_link_options(rexgpu-native PRIVATE -Wl,--no-undefined)
+    # The command thread (PM4 parsing, register file, render target / texture
+    # caches -- all compiled into this library) is the bottleneck in busy
+    # scenes: ThinLTO inlines across those files, x86-64-v3 for AVX2/BMI.
+    # No FMA contraction, so float results match the plain build.
+    option(REXGPU_NATIVE_LTO "ThinLTO + x86-64-v3 for the native renderer plugin" ON)
+    if(REXGPU_NATIVE_LTO)
+        target_compile_options(rexgpu-native PRIVATE -flto=thin -march=x86-64-v3 -ffp-contract=off)
+        target_link_options(rexgpu-native PRIVATE -flto=thin -fuse-ld=lld -march=x86-64-v3
+            -Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache)
+    endif()
+    target_compile_definitions(rexgpu-native PRIVATE REX_HAS_VULKAN=1)
+    target_link_libraries(rexgpu-native PRIVATE
+        rexruntime
+        xxHash::xxhash
+        Vulkan::Headers
+        GPUOpen::VulkanMemoryAllocator
+        glslang::SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler
+    )
+endif()
