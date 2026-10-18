@@ -35,11 +35,12 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(guest_vblank_rate, 0, "GPU",
-                     "Guest vblank interrupts per second (0 = the video mode's refresh "
-                     "rate). Games that present every second vblank run at half this "
-                     "rate, so 120 lets a 30 fps game run at 60.")
-    .range(0, 1000)
+REXCVAR_DEFINE_DOUBLE(guest_vblank_rate, 0.0, "GPU",
+                      "Guest vblank interrupts per second (0 = the video mode's refresh "
+                      "rate). Games that present every second vblank run at half this "
+                      "rate, so 120 lets a 30 fps game run at 60. Use twice the display's "
+                      "exact refresh rate (e.g. 119.96 for 59.98 Hz) with vsync so frames "
+                      "don't drift against the display.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
@@ -169,8 +170,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          if (int32_t rate = REXCVAR_GET(guest_vblank_rate); rate > 0 && REXCVAR_GET(vsync)) {
-            interval_ticks = std::max(uint64_t(1), guest_tick_frequency / uint64_t(rate));
+          if (double rate = REXCVAR_GET(guest_vblank_rate); rate > 0.0 && REXCVAR_GET(vsync)) {
+            interval_ticks = std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / rate));
           }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();

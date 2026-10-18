@@ -250,9 +250,8 @@ const char* TransferModeName(TransferMode mode) {
 }
 
 namespace {
-// Spike logger: any frame (swap to swap) over kSpikeMs is logged with what
-// happened during it.
-constexpr double kSpikeMs = 25.0;
+// Spike logger: any frame (swap to swap) over FH2_SPIKE_MS (default 25 ms,
+// live) is logged with what happened during it.
 Counters g_frame_start_counters;
 uint64_t g_frame_start_idle_ns = 0, g_frame_start_wait_ns = 0, g_frame_start_upload = 0;
 std::chrono::steady_clock::time_point g_last_swap;
@@ -376,7 +375,7 @@ void OnSwap() {
     uint64_t upload = rex::graphics::g_shared_memory_upload_bytes.load(std::memory_order_relaxed);
     if (g_frame > 300) {
       double frame_ms = std::chrono::duration<double, std::milli>(now - g_last_swap).count();
-      if (frame_ms > kSpikeMs) {
+      if (frame_ms > double(TimedEnvInt("FH2_SPIKE_MS", 25))) {
         const Counters& c = g_counters;
         const Counters& s = g_frame_start_counters;
         REXGPU_INFO(

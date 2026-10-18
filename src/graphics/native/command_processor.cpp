@@ -12,10 +12,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -65,6 +67,23 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(skip_pixel_shaders, "", "GPU",
+                      "Comma-separated pixel shader ucode hashes (hex, as in the renderer "
+                      "frame log) whose draws are skipped, e.g. to turn off a post-process "
+                      "pass such as motion blur")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(log_depth_bias, false, "GPU",
+                    "Log each distinct guest polygon offset (constant, slope, depth format) "
+                    "the first time a draw uses it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(depth_bias_min_offset, 0.0, "GPU",
+                      "Minimum magnitude of a nonzero guest constant polygon offset, in guest "
+                      "depth units (0 = off). Decals (blood pools, bullet holes) with a tiny "
+                      "bias can z-fight with the surface under them on the host.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
@@ -3737,6 +3756,35 @@ void VulkanCommandProcessor::Fh2LoadShaderImpl(xenos::ShaderType shader_type,
   }
 }
 
+namespace {
+// --skip_pixel_shaders, parsed again only when the string changes.
+bool IsPixelShaderSkipped(uint64_t hash) {
+  static std::mutex mutex;
+  static std::string parsed_from;
+  static std::vector<uint64_t> hashes;
+  std::string value = REXCVAR_GET(skip_pixel_shaders);
+  if (value.empty() && hashes.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex);
+  if (value != parsed_from) {
+    parsed_from = value;
+    hashes.clear();
+    size_t pos = 0;
+    while (pos < value.size()) {
+      size_t comma = value.find(',', pos);
+      if (comma == std::string::npos) comma = value.size();
+      std::string item = value.substr(pos, comma - pos);
+      if (!item.empty()) {
+        hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+      }
+      pos = comma + 1;
+    }
+  }
+  return std::find(hashes.begin(), hashes.end(), hash) != hashes.end();
+}
+}  // namespace
+
 bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint32_t index_count,
                                            IndexBufferInfo* index_buffer_info,
                                            bool major_mode_explicit) {
@@ -3819,6 +3867,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       // This draw has no effect.
       return true;
     }
+  }
+  if (pixel_shader && IsPixelShaderSkipped(pixel_shader->ucode_data_hash())) {
+    return true;
   }
   // FH2 graphics option: motion blur off (FH2_MOTION_BLUR=0, the default).
   // The final post pass (pixel shader 614588022744BF6B) averages 5 scene taps
@@ -6387,6 +6438,28 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     float depth_bias_constant_factor, depth_bias_slope_factor;
     draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
                                              depth_bias_constant_factor);
+    if (depth_bias_constant_factor != 0.0f) {
+      float min_offset = float(REXCVAR_GET(depth_bias_min_offset));
+      if (std::abs(depth_bias_constant_factor) < min_offset) {
+        depth_bias_constant_factor = std::copysign(min_offset, depth_bias_constant_factor);
+      }
+    }
+    if (REXCVAR_GET(log_depth_bias) &&
+        (depth_bias_constant_factor != 0.0f || depth_bias_slope_factor != 0.0f)) {
+      static std::mutex logged_mutex;
+      static std::set<std::tuple<float, float, uint32_t>> logged;
+      auto depth_format = uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format);
+      std::lock_guard<std::mutex> lock(logged_mutex);
+      if (logged.size() < 256 &&
+          logged.emplace(depth_bias_constant_factor, depth_bias_slope_factor, depth_format)
+              .second) {
+        REXGPU_INFO("[DEPTHBIAS] constant {:g} slope {:g} depth format {}",
+                    depth_bias_constant_factor, depth_bias_slope_factor,
+                    depth_format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8)
+                        ? "D24FS8"
+                        : "D24S8");
+      }
+    }
     depth_bias_constant_factor *=
         regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
             ? draw_util::kD3D10PolygonOffsetFactorUnorm24
