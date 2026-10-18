@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <span>
 #include <cstring>
 #include <utility>
 
@@ -95,6 +96,7 @@ void SharedMemory::InvalidateAllPages() {
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
             system_page_flags_valid_and_gpu_written_.end(), uint64_t(0));
+  invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -103,6 +105,7 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   // Pages that are valid only because the CPU uploaded them lose their valid
   // bit here, so the next frame re-reads them from guest memory.
   system_page_flags_valid_ = system_page_flags_valid_and_gpu_written_;
+  invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void SharedMemory::ClearCache() {
@@ -343,8 +346,18 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  // This runs for every vertex/index buffer of every draw (over 100k times a
+  // second), almost always with one range: keep the working set on the stack
+  // instead of allocating a vector per call.
+  constexpr size_t kInlineRanges = 32;
+  std::pair<uint32_t, uint32_t> inline_ranges[kInlineRanges];
+  std::vector<std::pair<uint32_t, uint32_t>> heap_ranges;
+  std::pair<uint32_t, uint32_t>* merged = inline_ranges;
+  if (count > kInlineRanges) {
+    heap_ranges.resize(count);
+    merged = heap_ranges.data();
+  }
+  size_t merged_count = 0;
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -354,34 +367,37 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     if (start > kBufferSize || (kBufferSize - start) < length) {
       return false;
     }
-    merged_ranges.emplace_back(start, length);
+    merged[merged_count++] = {start, length};
   }
-  if (merged_ranges.empty()) {
+  if (!merged_count) {
     return true;
   }
 
   SCOPE_profile_cpu_f("gpu");
 
-  std::sort(merged_ranges.begin(), merged_ranges.end(),
-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
-              return a.first < b.first;
-            });
-  size_t merged_write = 0;
-  for (size_t i = 1; i < merged_ranges.size(); ++i) {
-    std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
-    const std::pair<uint32_t, uint32_t>& range_current = merged_ranges[i];
-    uint64_t previous_end = uint64_t(range_previous.first) + uint64_t(range_previous.second);
-    uint64_t current_start = uint64_t(range_current.first);
-    if (current_start <= previous_end) {
-      uint64_t current_end = current_start + uint64_t(range_current.second);
-      if (current_end > previous_end) {
-        range_previous.second = uint32_t(current_end - uint64_t(range_previous.first));
+  if (merged_count > 1) {
+    std::sort(merged, merged + merged_count,
+              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+                return a.first < b.first;
+              });
+    size_t merged_write = 0;
+    for (size_t i = 1; i < merged_count; ++i) {
+      std::pair<uint32_t, uint32_t>& range_previous = merged[merged_write];
+      const std::pair<uint32_t, uint32_t>& range_current = merged[i];
+      uint64_t previous_end = uint64_t(range_previous.first) + uint64_t(range_previous.second);
+      uint64_t current_start = uint64_t(range_current.first);
+      if (current_start <= previous_end) {
+        uint64_t current_end = current_start + uint64_t(range_current.second);
+        if (current_end > previous_end) {
+          range_previous.second = uint32_t(current_end - uint64_t(range_previous.first));
+        }
+      } else {
+        merged[++merged_write] = range_current;
       }
-    } else {
-      merged_ranges[++merged_write] = range_current;
     }
+    merged_count = merged_write + 1;
   }
-  merged_ranges.resize(merged_write + 1);
+  const std::span<const std::pair<uint32_t, uint32_t>> merged_ranges(merged, merged_count);
 
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
@@ -527,6 +543,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
+  invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel);
 
   FireWatches(page_first, page_last, false);
 

@@ -13,7 +13,7 @@
 #include <cstring>
 #include <utility>
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || defined(__linux__)
 #include <sys/mman.h>
 #endif
 
@@ -42,6 +42,29 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
 namespace rex::memory {
+
+namespace {
+std::atomic<uint64_t> g_invalidation_bytes[size_t(InvalidationSource::kCount)];
+std::atomic<uint64_t> g_invalidation_calls[size_t(InvalidationSource::kCount)];
+}  // namespace
+
+void CountInvalidation(InvalidationSource source, uint64_t bytes) {
+  g_invalidation_bytes[size_t(source)].fetch_add(bytes, std::memory_order_relaxed);
+  g_invalidation_calls[size_t(source)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string TakeInvalidationStats(double window_seconds) {
+  static const char* const kNames[] = {"fault", "decommit", "release", "protect", "file"};
+  std::string out;
+  for (size_t i = 0; i < size_t(InvalidationSource::kCount); ++i) {
+    uint64_t bytes = g_invalidation_bytes[i].exchange(0);
+    uint64_t calls = g_invalidation_calls[i].exchange(0);
+    if (!calls) continue;
+    out += fmt::format(" {}={:.0f}/s:{:.1f}MB/s", kNames[i], calls / window_seconds,
+                       bytes / window_seconds / 1048576.0);
+  }
+  return out;
+}
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
@@ -531,7 +554,7 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
-bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+bool Memory::AccessViolationCallback(std::unique_lock<rex::thread::global_mutex_type> global_lock_locked_once,
                                      void* host_address, bool is_write) {
   // Access via physical_membase_ is special, when need to bypass everything
   // (for instance, for a data provider to actually write the data) so only
@@ -556,6 +579,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   // Will be rounded to physical page boundaries internally, so just pass 1 as
   // the length - guranteed not to cross page boundaries also.
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
+  CountInvalidation(InvalidationSource::kWriteFault, system_page_size_);
   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
                                       is_write, false)) {
     return true;
@@ -635,14 +659,14 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
 }
 
 bool Memory::AccessViolationCallbackThunk(
-    std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
+    std::unique_lock<rex::thread::global_mutex_type> global_lock_locked_once, void* context,
     void* host_address, bool is_write) {
   return reinterpret_cast<memory::Memory*>(context)->AccessViolationCallback(
       std::move(global_lock_locked_once), host_address, is_write);
 }
 
 bool Memory::TriggerPhysicalMemoryCallbacks(
-    std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
+    std::unique_lock<rex::thread::global_mutex_type> global_lock_locked_once, uint32_t virtual_address,
     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect) {
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap) {
@@ -907,7 +931,7 @@ BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_siz
 
 BaseHeap::~BaseHeap() = default;
 
-std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
+std::unique_lock<rex::thread::global_mutex_type> BaseHeap::AcquireHostPageReconcileLock() const {
   if (page_size_ >= memory_->system_page_size_) {
     return {};
   }
@@ -1385,6 +1409,37 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   return true;
 }
 
+void BaseHeap::ZeroCommittedPages(uint32_t start_page_number, uint32_t end_page_number) {
+  // Only whole host pages can be made writable independently.
+  if (page_size_ < memory_->system_page_size_) {
+    return;
+  }
+  uint32_t page = start_page_number;
+  while (page <= end_page_number) {
+    if (!(page_table_[page].state & memory::kMemoryAllocationCommit)) {
+      ++page;
+      continue;
+    }
+    uint32_t run_start = page;
+    while (page <= end_page_number &&
+           (page_table_[page].state & memory::kMemoryAllocationCommit)) {
+      ++page;
+    }
+    void* host = TranslateRelative(run_start << page_size_shift_);
+    size_t length = size_t(page - run_start) << page_size_shift_;
+    // Callers re-apply the final access through SyncHostPageAccess.
+    rex::memory::Protect(host, length, rex::memory::PageAccess::kReadWrite, nullptr);
+#if defined(__linux__)
+    // Punch a hole in the shared backing: frees the pages and makes the range
+    // read back as zero without touching (and thereby allocating) anything.
+    if (madvise(host, length, MADV_REMOVE) == 0) {
+      continue;
+    }
+#endif
+    std::memset(host, 0, length);
+  }
+}
+
 bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
                           uint32_t alignment, uint32_t allocation_type, uint32_t protect,
                           bool top_down, uint32_t* out_address) {
@@ -1569,6 +1624,8 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
     return false;
   }*/
 
+  ZeroCommittedPages(start_page_number, end_page_number);
+
   // Perform table change.
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
@@ -1604,6 +1661,9 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   if (out_region_size) {
     *out_region_size = (base_page_entry.region_page_count << page_size_shift_);
   }
+
+  ZeroCommittedPages(base_page_number,
+                     base_page_number + base_page_entry.region_page_count - 1);
 
   // Release from host not needed as mapping reserves the range for us.
   // TODO(benvanik): protect with NOACCESS?
@@ -2014,6 +2074,7 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
   }
 
   // Not caring about the contents anymore.
+  CountInvalidation(InvalidationSource::kDecommit, size);
   TriggerCallbacks(std::move(global_lock), address, size, true, true);
 
   return BaseHeap::Decommit(address, size);
@@ -2038,6 +2099,7 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // thus callback handlers will keep considering this range valid forever.
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
+    CountInvalidation(InvalidationSource::kRelease, region_size);
     TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true);
   }
 
@@ -2051,6 +2113,7 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance.
   if (protect & memory::kMemoryProtectWrite) {
+    CountInvalidation(InvalidationSource::kProtect, size);
     TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
   }
 
@@ -2172,7 +2235,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
   }
 }
 
-bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+bool PhysicalHeap::TriggerCallbacks(std::unique_lock<rex::thread::global_mutex_type> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
                                     bool unwatch_exact_range, bool unprotect) {
   // TODO(Triang3l): Support read watches.
@@ -2329,7 +2392,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
   return true;
 }
 
-std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {
+std::unique_lock<rex::thread::global_mutex_type> PhysicalHeap::AcquireHostPageReconcileLock() const {
   auto lock = BaseHeap::AcquireHostPageReconcileLock();
   if (!lock.owns_lock() && parent_heap_ && parent_heap_->page_size() < memory_->system_page_size_) {
     lock = rex::thread::global_critical_region::AcquireDirect();

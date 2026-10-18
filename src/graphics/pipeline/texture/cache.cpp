@@ -687,7 +687,7 @@ TextureCache::Texture::~Texture() {
 }
 
 void TextureCache::Texture::MakeUpToDateAndWatch(
-    const std::unique_lock<std::recursive_mutex>& global_lock) {
+    const std::unique_lock<rex::thread::global_mutex_type>& global_lock) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
   if (base_outdated_) {
     assert_not_zero(GetGuestBaseSize());
@@ -733,7 +733,7 @@ void TextureCache::Texture::MarkAsUsed() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+    [[maybe_unused]] const std::unique_lock<rex::thread::global_mutex_type>& global_lock, bool is_mip) {
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -747,7 +747,7 @@ void TextureCache::Texture::WatchCallback(
   }
 }
 
-void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
+void TextureCache::WatchCallback(const std::unique_lock<rex::thread::global_mutex_type>& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
@@ -764,13 +764,19 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
-    texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+    // The layout depends only on the key: memoized (computing it was ~3% of
+    // the GPU thread, as this runs on every binding change).
+    auto layout_it = guest_layout_extents_.find(key);
+    if (layout_it == guest_layout_extents_.end()) {
+      texture_util::TextureGuestLayout layout = key.GetGuestLayout();
+      layout_it = guest_layout_extents_
+                      .emplace(key, std::make_pair(layout.base.level_data_extent_bytes,
+                                                   layout.mips_total_extent_bytes))
+                      .first;
+    }
+    uint32_t base_extent = layout_it->second.first, mips_extent = layout_it->second.second;
+    if ((base_extent && IsRangeScaledResolved(key.base_page << 12, base_extent)) ||
+        (mips_extent && IsRangeScaledResolved(key.mip_page << 12, mips_extent))) {
       key.scaled_resolve = 1;
     }
   }
@@ -1064,7 +1070,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
-    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    const std::unique_lock<rex::thread::global_mutex_type>& global_lock, void* context,
     uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
   TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
   texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
@@ -1072,7 +1078,7 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallback(
-    const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
+    const std::unique_lock<rex::thread::global_mutex_type>& global_lock, uint32_t address_first,
     uint32_t address_last, bool invalidated_by_gpu) {
   assert_true(IsDrawResolutionScaled());
   if (invalidated_by_gpu) {

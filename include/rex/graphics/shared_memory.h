@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <utility>
@@ -34,7 +35,7 @@ class SharedMemory {
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
 
-  typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
+  typedef void (*GlobalWatchCallback)(const std::unique_lock<rex::thread::global_mutex_type>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
                                       bool invalidated_by_gpu);
   typedef void* GlobalWatchHandle;
@@ -48,7 +49,7 @@ class SharedMemory {
   // The callback is called within the global critical region.
   GlobalWatchHandle RegisterGlobalWatch(GlobalWatchCallback callback, void* callback_context);
   void UnregisterGlobalWatch(GlobalWatchHandle handle);
-  typedef void (*WatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
+  typedef void (*WatchCallback)(const std::unique_lock<rex::thread::global_mutex_type>& global_lock,
                                 void* context, void* data, uint64_t argument,
                                 bool invalidated_by_gpu);
   typedef void* WatchHandle;
@@ -78,6 +79,12 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  // Incremented whenever pages lose their valid state: a range requested
+  // successfully stays valid while this is unchanged (callers can skip
+  // requesting it again, and the global lock that takes).
+  uint64_t invalidation_epoch() const {
+    return invalidation_epoch_.load(std::memory_order_acquire);
+  }
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -172,6 +179,7 @@ class SharedMemory {
 
   // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;
+  std::atomic<uint64_t> invalidation_epoch_{1};
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;

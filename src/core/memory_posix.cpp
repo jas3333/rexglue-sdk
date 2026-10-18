@@ -200,25 +200,15 @@ static bool IsRangeFullyMapped(void* base_address, size_t length) {
     return false;
   }
 
-  std::ifstream maps("/proc/self/maps");
-  if (!maps.is_open())
+  // msync fails with ENOMEM if any page of the range is unmapped, and is a
+  // no-op for anonymous memory with MS_ASYNC. Parsing /proc/self/maps instead
+  // took milliseconds per call once the process has thousands of mappings
+  // (every commit into a reservation does this: hitches while the game
+  // allocates, e.g. at FH2's race start).
+  if (begin % page_size() != 0) {
     return false;
-
-  uintptr_t cursor = begin;
-  std::string line;
-  while (std::getline(maps, line)) {
-    LinuxMapEntry e;
-    if (!ParseProcMapsLine(line, e))
-      continue;
-    if (e.end <= cursor)
-      continue;
-    if (e.start > cursor)
-      return false;  // gap found
-    cursor = e.end;
-    if (cursor >= end)
-      return true;
   }
-  return cursor >= end;
+  return msync(base_address, length, MS_ASYNC) == 0;
 }
 
 // Convert /proc/self/maps permission chars to PageAccess
@@ -483,6 +473,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // Everything maps through the descriptor, never the name, so drop the name
+  // now. Otherwise any exit that skips CloseFileMappingHandle (the title's
+  // hard exit, a crash, a kill) leaks a multi-GiB object in /dev/shm whose
+  // touched pages stay resident until /dev/shm fills and mappings SIGBUS.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }

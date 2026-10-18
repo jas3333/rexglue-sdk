@@ -36,6 +36,10 @@ class ByteStream;
 
 namespace rex::graphics {
 
+extern std::atomic<uint64_t> g_command_processor_idle_ns;
+extern std::atomic<uint64_t> g_command_processor_wait_reg_mem_ns;
+
+
 class GraphicsSystem;
 class Shader;
 
@@ -171,6 +175,19 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // Around packets with side effects outside the register file (fences,
+  // memory writes, waits, interrupts, swaps, queries) and around queued
+  // CallInThread functions: a backend that processes draws on another thread
+  // finishes everything before them (and runs them in order).
+  // opcode: the PM4 type-3 opcode, or UINT32_MAX for CallInThread functions.
+  virtual void OnOrderedPacketBegin(uint32_t opcode) {}
+  virtual void OnOrderedPacketEnd() {}
+  static bool IsOrderedPacketOpcode(uint32_t opcode);
+  // A fence-like 32-bit memory write (already in guest byte order) that must
+  // become visible only after all earlier draws were processed.
+  virtual void WriteFenceMemory32(uint32_t address, uint32_t guest_value) {
+    memory::store(memory_->TranslatePhysical(address), guest_value);
+  }
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -260,6 +277,11 @@ class CommandProcessor {
   // them instead of dropping the write entirely.
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
 
+  // Packet-stream trace for backends (predicated tiling analysis): indirect
+  // buffer calls, bin select changes and draws skipped by the bin check.
+  enum class Pm4TraceEvent { kIndirectBuffer, kBinSelect, kPredicatedSkip, kWaitRegMem };
+  virtual void OnPm4Trace(Pm4TraceEvent event, uint32_t a, uint32_t b) {}
+
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
 
@@ -276,6 +298,7 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+  mutable int legacy_readback_memexport_set_ = -1;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
