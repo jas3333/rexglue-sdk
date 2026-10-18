@@ -37,6 +37,10 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(log_fps, false, "GPU",
+                    "Log the guest frame rate (swaps per second) every 5 seconds")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -943,6 +947,29 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     last_frame_tick = now;
   }
 #endif
+  if (REXCVAR_GET(log_fps)) {
+    static uint64_t window_start = 0;
+    static uint32_t window_swaps = 0;
+    static uint64_t worst_ticks = 0;
+    static uint64_t last_swap = 0;
+    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+    if (!window_start) {
+      window_start = now;
+    } else {
+      ++window_swaps;
+      worst_ticks = std::max(worst_ticks, now - last_swap);
+      if (now - window_start >= 5 * freq) {
+        REXGPU_INFO("[FPS] {:.1f} fps over {:.1f} s, worst frame {:.1f} ms",
+                    double(window_swaps) * freq / double(now - window_start),
+                    double(now - window_start) / freq, worst_ticks * 1000.0 / freq);
+        window_start = now;
+        window_swaps = 0;
+        worst_ticks = 0;
+      }
+    }
+    last_swap = now;
+  }
   rex::perf::Profiler::Flip();
 
   // Xenia-specific VdSwap hook.
