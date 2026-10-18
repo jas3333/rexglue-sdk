@@ -82,4 +82,14 @@ void UnregisterBind(std::string_view name);
  */
 bool ProcessKeyEvent(KeyEvent& e);
 
+/**
+ * Run a registered bind's callback by its CVAR name, as if its key were
+ * pressed (for scripted input, e.g. a debug control channel). Call it on the
+ * thread that normally handles key events.
+ *
+ * @param name  The CVAR name used when registering the bind.
+ * @return      True if a live bind with that name was found.
+ */
+bool TriggerBind(std::string_view name);
+
 }  // namespace rex::ui

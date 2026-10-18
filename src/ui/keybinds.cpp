@@ -223,4 +223,15 @@ bool ProcessKeyEvent(KeyEvent& e) {
   return false;
 }
 
+bool TriggerBind(std::string_view name) {
+  std::lock_guard lock(g_binds_mutex);
+  for (auto& entry : g_binds) {
+    if (entry.callback && entry.name == name) {
+      entry.callback();
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace rex::ui
