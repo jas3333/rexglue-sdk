@@ -12,6 +12,8 @@
 #include <rex/rex_app.h>
 
 #include <cstdlib>
+#include <vector>
+#include <cstdio>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -37,6 +39,7 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/presenter.h>
 #include <rex/version.h>
 
 #include <fmt/format.h>
@@ -361,6 +364,7 @@ bool ReXApp::SetupPresentation() {
   if (graphics_system && graphics_system->presenter()) {
     // SDK mode: the emulated-Xenos presenter drives the overlays.
     auto* presenter = graphics_system->presenter();
+    screenshot_presenter_ = presenter;
     auto* provider = graphics_system->provider();
     if (provider) {
       immediate_drawer_ = provider->CreateImmediateDrawer();
@@ -394,6 +398,8 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+  rex::ui::RegisterBind("bind_screenshot", "F12", "Save a screenshot (screenshots/*.ppm)",
+                        [this] { SaveScreenshot(); });
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
@@ -489,6 +495,39 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
     }
     LaunchModule();
   };
+}
+
+// F12 (bind_screenshot): save the guest output (full internal resolution,
+// before any window scaling) as a PPM in ./screenshots next to the working
+// directory. A bind so it can also be triggered without a keyboard.
+void ReXApp::SaveScreenshot() {
+  // The window's presenter (config_.graphics is handed to the runtime).
+  rex::ui::Presenter* presenter = screenshot_presenter_;
+  rex::ui::RawImage image;
+  if (presenter && presenter->CaptureGuestOutput(image) && image.width && image.height) {
+    std::filesystem::create_directories("screenshots");
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    std::string path = fmt::format(
+        "screenshots/shot-{}.ppm",
+        std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+    if (FILE* file = std::fopen(path.c_str(), "wb")) {
+      std::fprintf(file, "P6\n%u %u\n255\n", image.width, image.height);
+      std::vector<uint8_t> row(size_t(image.width) * 3);
+      for (uint32_t y = 0; y < image.height; ++y) {
+        const uint8_t* source = image.data.data() + y * image.stride;
+        for (uint32_t x = 0; x < image.width; ++x) {
+          row[x * 3 + 0] = source[x * 4 + 0];
+          row[x * 3 + 1] = source[x * 4 + 1];
+          row[x * 3 + 2] = source[x * 4 + 2];
+        }
+        std::fwrite(row.data(), 1, row.size(), file);
+      }
+      std::fclose(file);
+      REXLOG_INFO("Screenshot saved: {} ({}x{})", path, image.width, image.height);
+    }
+  } else {
+    REXLOG_WARN("Screenshot failed: {}", presenter ? "no guest output to capture" : "no presenter");
+  }
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {

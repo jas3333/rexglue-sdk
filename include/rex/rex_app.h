@@ -284,6 +284,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnRestored(ui::UIEvent& e) override;
 
   // WindowInputListener overrides
+  void SaveScreenshot();
   void OnKeyDown(ui::KeyEvent& e) override;
 
   PPCImageInfo ppc_info_;
@@ -311,6 +312,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
   std::filesystem::path config_path_;
+  // Guest output presenter, for F12 screenshots.
+  rex::ui::Presenter* screenshot_presenter_ = nullptr;
 };
 
 }  // namespace rex
